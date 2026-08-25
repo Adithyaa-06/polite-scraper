@@ -216,3 +216,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Scraper cache (raw HTML) — never committed, per spec
+cache/

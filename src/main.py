@@ -1,0 +1,1 @@
+"""Entry point for the polite scraper — FlyRank A9."""
