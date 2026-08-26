@@ -2,6 +2,7 @@
 
 import os
 import time
+from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 import requests
@@ -15,6 +16,8 @@ DELAY_SECONDS = 0.5
 BASE_URL = "https://books.toscrape.com"
 CATALOGUE_URL = f"{BASE_URL}/catalogue/page-1.html"
 MAX_CATALOGUE_PAGES = 3
+
+RATING_WORDS = {"One", "Two", "Three", "Four", "Five"}
 
 
 def fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
@@ -38,6 +41,10 @@ def fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
     if response.status_code != 200:
         raise RuntimeError(f"FETCH FAILED: {url} returned status {response.status_code}")
 
+    # Force UTF-8 decoding explicitly — requests sometimes guesses the wrong
+    # encoding when a site's headers don't declare it clearly, which was
+    # showing up as mojibake (Â£ instead of £) in price_text.
+    response.encoding = "utf-8"
     html = response.text
     with open(cache_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -49,10 +56,10 @@ def fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
 def discover_catalogue_pages():
     """Walk the catalogue's own 'next' links, up to MAX_CATALOGUE_PAGES.
 
-    Returns (book_urls, pages_visited) where book_urls is a de-duplicated
-    list of absolute book detail-page URLs, in first-seen order.
+    Returns a list of (book_url, source_page_url) tuples, de-duplicated
+    by book_url, in first-seen order.
     """
-    book_urls: list[str] = []
+    book_entries: list[tuple[str, str]] = []
     seen: set[str] = set()
 
     current_url = CATALOGUE_URL
@@ -68,27 +75,81 @@ def discover_catalogue_pages():
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # Every book on the page lives in an <article class="product_pod">,
-        # with its link in the <h3><a href="..."> inside it.
         for article in soup.select("article.product_pod"):
             link = article.select_one("h3 a")
             if link and link.get("href"):
                 absolute_url = urljoin(current_url, link["href"])
                 if absolute_url not in seen:
                     seen.add(absolute_url)
-                    book_urls.append(absolute_url)
+                    book_entries.append((absolute_url, current_url))
 
-        # Follow the site's own "next" link rather than hardcoding page URLs.
         next_link = soup.select_one("li.next a")
         if not next_link or page_num == MAX_CATALOGUE_PAGES:
             break
         current_url = urljoin(current_url, next_link["href"])
 
-    return book_urls, pages_visited
+    return book_entries, pages_visited
+
+
+def cache_filename_for_book(book_url: str) -> str:
+    """Derive a stable cache filename from a book's slug, e.g.
+    'a-light-in-the-attic_1000' -> 'book-a-light-in-the-attic_1000.html'."""
+    slug = book_url.rstrip("/").split("/")[-2]
+    return f"book-{slug}.html"
+
+
+def extract_book_record(book_url: str, source_page: str) -> dict:
+    """Fetch one book detail page and pull out the raw record fields."""
+    cache_filename = cache_filename_for_book(book_url)
+    html, was_cached = fetch_page(book_url, cache_filename)
+
+    if not was_cached:
+        time.sleep(DELAY_SECONDS)
+
+    soup = BeautifulSoup(html, "html.parser")
+    product_main = soup.select_one("div.product_main")
+
+    title = product_main.select_one("h1").get_text(strip=True) if product_main else None
+
+    price_el = product_main.select_one("p.price_color") if product_main else None
+    price_text = price_el.get_text(strip=True) if price_el else None
+
+    availability_el = product_main.select_one("p.availability") if product_main else None
+    availability_text = availability_el.get_text(strip=True) if availability_el else None
+
+    rating_text = None
+    if product_main:
+        star_p = product_main.select_one("p.star-rating")
+        if star_p:
+            classes = star_p.get("class", [])
+            rating_text = next((c for c in classes if c in RATING_WORDS), None)
+
+    description_el = soup.select_one("#product_description ~ p")
+    description = description_el.get_text(strip=True) if description_el else None
+
+    return {
+        "title": title,
+        "product_url": book_url,
+        "price_text": price_text,
+        "availability_text": availability_text,
+        "rating_text": rating_text,
+        "description": description,
+        "source_page": source_page,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 if __name__ == "__main__":
-    urls, pages = discover_catalogue_pages()
+    entries, pages = discover_catalogue_pages()
     print(f"catalogue_pages={pages}")
-    print(f"discovered={len(urls)}")
-    print(f"unique_urls={len(set(urls))}")
+    print(f"discovered={len(entries)}")
+    print(f"unique_urls={len(set(u for u, _ in entries))}")
+
+    records = []
+    for book_url, source_page in entries:
+        record = extract_book_record(book_url, source_page)
+        records.append(record)
+
+    print(f"detail_pages={len(records)}")
+    print("--- sample record ---")
+    print(records[0])
