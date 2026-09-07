@@ -16,12 +16,21 @@ TIMEOUT_SECONDS = 10
 CACHE_DIR = "cache"
 OUTPUT_DIR = "output"
 DELAY_SECONDS = 0.5
+RETRY_WAIT_SECONDS = 2
 
 BASE_URL = "https://books.toscrape.com"
 CATALOGUE_URL = f"{BASE_URL}/catalogue/page-1.html"
 MAX_CATALOGUE_PAGES = 3
 
 RATING_WORDS = {"One", "Two", "Three", "Four", "Five"}
+
+# Set to True to inject one deliberately broken URL, per the Stage 5
+# checkpoint. Leave False for a normal run.
+INJECT_FAKE_URL_FOR_TESTING = False
+
+# Simple run-scoped counter for cache hits, incremented inside fetch_page.
+# Reset at the start of each run in __main__.
+_cache_hit_count = 0
 
 
 class BookRecord(BaseModel):
@@ -37,12 +46,30 @@ class BookRecord(BaseModel):
     fetched_at: str
 
 
+class FetchFailed(Exception):
+    """Raised when a page could not be fetched after retries.
+
+    Carries the HTTP status code (or None for connection/timeout errors)
+    so the caller can log a useful reason without re-inspecting requests
+    exceptions.
+    """
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
     """Fetch a page politely, using the cache if we already have it.
 
-    Returns (html, was_cached). Prints FETCH on a real network request,
-    CACHE HIT when reading from disk instead.
+    Retries once on a timeout or a 5xx server error, after a short wait.
+    Does NOT retry on 404 (the page does not exist) or 403 (the site said
+    no) — retrying either of those only pesters the server for no gain.
+
+    Returns (html, was_cached). Raises FetchFailed if the page could not
+    be retrieved after the retry.
     """
+    global _cache_hit_count
+
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, cache_filename)
 
@@ -50,21 +77,51 @@ def fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
         with open(cache_path, "r", encoding="utf-8") as f:
             html = f.read()
         print(f"CACHE HIT: {cache_filename} ({len(html)} bytes)")
+        _cache_hit_count += 1
         return html, True
 
     headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+    last_error: FetchFailed | None = None
 
-    if response.status_code != 200:
-        raise RuntimeError(f"FETCH FAILED: {url} returned status {response.status_code}")
+    for attempt in (1, 2):
+        try:
+            response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+        except requests.exceptions.Timeout:
+            last_error = FetchFailed(f"timeout fetching {url}", status_code=None)
+            if attempt == 1:
+                time.sleep(RETRY_WAIT_SECONDS)
+                continue
+            raise last_error
 
-    response.encoding = "utf-8"
-    html = response.text
-    with open(cache_path, "w", encoding="utf-8") as f:
-        f.write(html)
+        if response.status_code == 200:
+            response.encoding = "utf-8"
+            html = response.text
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"FETCH: {cache_filename} ({len(html)} bytes)")
+            return html, False
 
-    print(f"FETCH: {cache_filename} ({len(html)} bytes)")
-    return html, False
+        if response.status_code in (404, 403):
+            # Permanent failures — asking again will not help.
+            raise FetchFailed(
+                f"{url} returned {response.status_code}", status_code=response.status_code
+            )
+
+        if response.status_code >= 500:
+            last_error = FetchFailed(
+                f"{url} returned {response.status_code}", status_code=response.status_code
+            )
+            if attempt == 1:
+                time.sleep(RETRY_WAIT_SECONDS)
+                continue
+            raise last_error
+
+        raise FetchFailed(
+            f"{url} returned unexpected status {response.status_code}",
+            status_code=response.status_code,
+        )
+
+    raise last_error
 
 
 def discover_catalogue_pages():
@@ -102,6 +159,10 @@ def discover_catalogue_pages():
             break
         current_url = urljoin(current_url, next_link["href"])
 
+    if INJECT_FAKE_URL_FOR_TESTING:
+        fake_url = urljoin(BASE_URL, "catalogue/this-book-does-not-exist_0000/index.html")
+        book_entries.append((fake_url, CATALOGUE_URL))
+
     return book_entries, pages_visited
 
 
@@ -113,15 +174,17 @@ def cache_filename_for_book(book_url: str) -> str:
 
 
 def parse_price_gbp(price_text: str) -> float:
-    """Turn '£51.77' into 51.77. Strips any non-numeric characters except
-    the decimal point, since the currency symbol (and any stray encoding
-    artifacts) should never reach the numeric value."""
+    """Turn '£51.77' into 51.77."""
     cleaned = re.sub(r"[^0-9.]", "", price_text)
     return float(cleaned)
 
 
 def extract_raw_record(book_url: str, source_page: str) -> dict:
-    """Fetch one book detail page and pull out the raw record fields."""
+    """Fetch one book detail page and pull out the raw record fields.
+
+    May raise FetchFailed — the caller is responsible for catching it
+    and logging the page as failed rather than crashing the whole run.
+    """
     cache_filename = cache_filename_for_book(book_url)
     html, was_cached = fetch_page(book_url, cache_filename)
 
@@ -164,8 +227,7 @@ def extract_raw_record(book_url: str, source_page: str) -> dict:
 def clean_and_validate(raw: dict) -> tuple[BookRecord | None, str | None]:
     """Attempt to turn a raw record into a validated BookRecord.
 
-    Returns (record, None) on success, or (None, reason) on failure —
-    never both, never neither.
+    Returns (record, None) on success, or (None, reason) on failure.
     """
     try:
         price_gbp = parse_price_gbp(raw["price_text"]) if raw["price_text"] else None
@@ -189,32 +251,43 @@ def clean_and_validate(raw: dict) -> tuple[BookRecord | None, str | None]:
 
 
 if __name__ == "__main__":
-    entries, pages = discover_catalogue_pages()
-    print(f"catalogue_pages={pages}")
-    print(f"discovered={len(entries)}")
-    print(f"unique_urls={len(set(u for u, _ in entries))}")
+    _cache_hit_count = 0
 
+    run_started_at = datetime.now(timezone.utc)
+    start_time = time.monotonic()
+
+    pages_fetched = 0
+    failed_pages = 0
     valid_records: list[dict] = []
     errors: list[dict] = []
     seen_urls: set[str] = set()
 
+    entries, catalogue_pages_visited = discover_catalogue_pages()
+    pages_fetched += catalogue_pages_visited
+    print(f"catalogue_pages={catalogue_pages_visited}")
+    print(f"discovered={len(entries)}")
+    print(f"unique_urls={len(set(u for u, _ in entries))}")
+
     for book_url, source_page in entries:
-        raw = extract_raw_record(book_url, source_page)
+        try:
+            raw = extract_raw_record(book_url, source_page)
+        except FetchFailed as e:
+            failed_pages += 1
+            errors.append({"product_url": book_url, "reason": str(e)})
+            continue
+
+        pages_fetched += 1
         record, reason = clean_and_validate(raw)
 
         if record is None:
             errors.append({"product_url": book_url, "reason": reason})
             continue
 
-        # Canonical identity: the absolute product_url. Skip if we've
-        # already stored this exact URL (idempotency at the record level).
         canonical_url = str(record.product_url)
         if canonical_url in seen_urls:
             continue
         seen_urls.add(canonical_url)
 
-        # model_dump(mode="json") turns HttpUrl objects back into plain
-        # strings so json.dump doesn't choke on a non-serializable type.
         valid_records.append(record.model_dump(mode="json"))
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -225,6 +298,21 @@ if __name__ == "__main__":
     with open(os.path.join(OUTPUT_DIR, "errors.json"), "w", encoding="utf-8") as f:
         json.dump(errors, f, indent=2, ensure_ascii=False)
 
-    print(f"detail_pages={len(entries)}")
+    duration_seconds = round(time.monotonic() - start_time, 3)
+
+    run_report = {
+        "start_time": run_started_at.isoformat(),
+        "duration_seconds": duration_seconds,
+        "pages_fetched": pages_fetched,
+        "cache_hits": _cache_hit_count,
+        "valid_records": len(valid_records),
+        "invalid_records": len(errors),
+        "failed_pages": failed_pages,
+    }
+    with open(os.path.join(OUTPUT_DIR, "run-report.json"), "w", encoding="utf-8") as f:
+        json.dump(run_report, f, indent=2)
+
     print(f"valid_records={len(valid_records)}")
     print(f"invalid_records={len(errors)}")
+    print(f"failed_pages={failed_pages}")
+    print("run_report:", run_report)
