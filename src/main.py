@@ -1,16 +1,20 @@
 """Entry point for the polite scraper — FlyRank A9."""
 
+import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, ValidationError, HttpUrl
 
 USER_AGENT = "polite-scraper/1.0 (+https://github.com/Adithyaa-06/polite-scraper)"
 TIMEOUT_SECONDS = 10
 CACHE_DIR = "cache"
+OUTPUT_DIR = "output"
 DELAY_SECONDS = 0.5
 
 BASE_URL = "https://books.toscrape.com"
@@ -18,6 +22,19 @@ CATALOGUE_URL = f"{BASE_URL}/catalogue/page-1.html"
 MAX_CATALOGUE_PAGES = 3
 
 RATING_WORDS = {"One", "Two", "Three", "Four", "Five"}
+
+
+class BookRecord(BaseModel):
+    """The clean, validated shape of one book record."""
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str | None = None
+    description: str | None = None
+    source_page: HttpUrl
+    fetched_at: str
 
 
 def fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
@@ -41,9 +58,6 @@ def fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
     if response.status_code != 200:
         raise RuntimeError(f"FETCH FAILED: {url} returned status {response.status_code}")
 
-    # Force UTF-8 decoding explicitly — requests sometimes guesses the wrong
-    # encoding when a site's headers don't declare it clearly, which was
-    # showing up as mojibake (Â£ instead of £) in price_text.
     response.encoding = "utf-8"
     html = response.text
     with open(cache_path, "w", encoding="utf-8") as f:
@@ -98,7 +112,15 @@ def cache_filename_for_book(book_url: str) -> str:
     return f"book-{slug}.html"
 
 
-def extract_book_record(book_url: str, source_page: str) -> dict:
+def parse_price_gbp(price_text: str) -> float:
+    """Turn '£51.77' into 51.77. Strips any non-numeric characters except
+    the decimal point, since the currency symbol (and any stray encoding
+    artifacts) should never reach the numeric value."""
+    cleaned = re.sub(r"[^0-9.]", "", price_text)
+    return float(cleaned)
+
+
+def extract_raw_record(book_url: str, source_page: str) -> dict:
     """Fetch one book detail page and pull out the raw record fields."""
     cache_filename = cache_filename_for_book(book_url)
     html, was_cached = fetch_page(book_url, cache_filename)
@@ -139,17 +161,70 @@ def extract_book_record(book_url: str, source_page: str) -> dict:
     }
 
 
+def clean_and_validate(raw: dict) -> tuple[BookRecord | None, str | None]:
+    """Attempt to turn a raw record into a validated BookRecord.
+
+    Returns (record, None) on success, or (None, reason) on failure —
+    never both, never neither.
+    """
+    try:
+        price_gbp = parse_price_gbp(raw["price_text"]) if raw["price_text"] else None
+        if price_gbp is None:
+            return None, "missing or unparsable price_text"
+
+        record = BookRecord(
+            title=raw["title"],
+            product_url=raw["product_url"],
+            price_text=raw["price_text"],
+            price_gbp=price_gbp,
+            availability_text=raw["availability_text"],
+            rating_text=raw["rating_text"],
+            description=raw["description"],
+            source_page=raw["source_page"],
+            fetched_at=raw["fetched_at"],
+        )
+        return record, None
+    except (ValidationError, ValueError, TypeError, KeyError) as e:
+        return None, str(e)
+
+
 if __name__ == "__main__":
     entries, pages = discover_catalogue_pages()
     print(f"catalogue_pages={pages}")
     print(f"discovered={len(entries)}")
     print(f"unique_urls={len(set(u for u, _ in entries))}")
 
-    records = []
-    for book_url, source_page in entries:
-        record = extract_book_record(book_url, source_page)
-        records.append(record)
+    valid_records: list[dict] = []
+    errors: list[dict] = []
+    seen_urls: set[str] = set()
 
-    print(f"detail_pages={len(records)}")
-    print("--- sample record ---")
-    print(records[0])
+    for book_url, source_page in entries:
+        raw = extract_raw_record(book_url, source_page)
+        record, reason = clean_and_validate(raw)
+
+        if record is None:
+            errors.append({"product_url": book_url, "reason": reason})
+            continue
+
+        # Canonical identity: the absolute product_url. Skip if we've
+        # already stored this exact URL (idempotency at the record level).
+        canonical_url = str(record.product_url)
+        if canonical_url in seen_urls:
+            continue
+        seen_urls.add(canonical_url)
+
+        # model_dump(mode="json") turns HttpUrl objects back into plain
+        # strings so json.dump doesn't choke on a non-serializable type.
+        valid_records.append(record.model_dump(mode="json"))
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    with open(os.path.join(OUTPUT_DIR, "books.json"), "w", encoding="utf-8") as f:
+        json.dump(valid_records, f, indent=2, ensure_ascii=False)
+
+    with open(os.path.join(OUTPUT_DIR, "errors.json"), "w", encoding="utf-8") as f:
+        json.dump(errors, f, indent=2, ensure_ascii=False)
+
+    print(f"detail_pages={len(entries)}")
+    print(f"valid_records={len(valid_records)}")
+    print(f"invalid_records={len(errors)}")
